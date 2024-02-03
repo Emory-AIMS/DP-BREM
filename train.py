@@ -1,6 +1,8 @@
 import numpy as np
 from tqdm.auto import tqdm
 import pickle
+import time
+import os.path 
 
 
 import torch
@@ -9,7 +11,7 @@ import torch.multiprocessing as mp
 mp.set_start_method('spawn', force=True)
 
 from data import prepare_data_model
-from byzantine_attacks import byzantine_IPM_or_ALIE, byzantine_LF
+from byzantine_attacks import byzantine_IPM_or_ALIE, byzantine_LF, byzantine_MTB_minmax
 from utils import zeros_list_like, clip_list_, get_smoothed_and_clipped_gradient
 
 
@@ -112,7 +114,13 @@ def server_aggregate_average(global_model, global_momentum, client_momentums, se
                     
 
             # clipping (if necessary)
-            if max_client_clip_norm > 0:
+            if args.client_clip_type == "element_clip":
+                """
+                the paper `Privacy-Preserving Robust Federated Learning with Distributed Differential Privacy`
+                uses element clip with range [-0.1, 0.1]
+                """
+                clipped_one = [torch.clamp(param, -0.1, 0.1) for param in clipped_one] 
+            elif max_client_clip_norm > 0:
                 clip_list_(clipped_one, max_client_clip_norm)
 
             # add the clipped one to the sum
@@ -141,6 +149,30 @@ def server_aggregate_average(global_model, global_momentum, client_momentums, se
     return None
 
 
+def server_aggregate_sign(global_model, client_updates, selected, learn_rate, device):
+    """
+    "Bridging Differential Privacy and Byzantine-Robustness via Model Aggregation" [IJCAI' 2022]
+    Summary: client add local noise (note: the local updates differs from the conventional one), and server aggregate sign
+    """
+    with torch.no_grad():
+        server_grad = zeros_list_like(global_model, device)
+        for idx, param in enumerate(server_grad):
+            for i in selected:
+                param.add_(torch.sign(client_updates[i][idx]))
+
+        # update global model 
+        for idx, param in enumerate(global_model.parameters()):
+            param = param.data
+            server_grad = torch.zeros_like(param).to(device)
+            server_grad.add_( 0.004 * param )
+            for i in selected:
+                server_grad.add_(torch.sign(client_updates[i][idx]))
+
+            param.add_( -learn_rate*0.01 *  server_grad )
+
+    return None
+
+    
 
 def test_model(model, test_loader, device):
     """This function tests the model on test data and returns test loss and test accuracy """
@@ -215,12 +247,19 @@ def train_one_run(args, r=None, return_dict=None):
     global_momentum = zeros_list_like(global_model, device)
     client_momentums = [zeros_list_like(global_model, device) for _ in range(num_clients)]
 
+    if args.attack_type == 'mtb' and num_bad_clients > 0:
+        attacker.benign_momentums = [zeros_list_like(global_model, device) for _ in range(num_bad_clients)]
+
+    if args.aggregate_method == 'sign':
+        client_sign_models = [zeros_list_like(global_model, device) for _ in range(num_clients)]
+
 
     # train the model 
-    idx = 0
+    metric_idx = 0
+    start_time = time.time()
     for t in tqdm(range(num_iters), position=0, leave=True):
 
-        beta = args.client_momentum if t>0 else 0
+        beta = args.client_momentum
 
         if args.max_record_grad_norm < 0:
             max_record_grad_norm = -1
@@ -235,8 +274,9 @@ def train_one_run(args, r=None, return_dict=None):
             max_client_clip_norm = args.max_client_clip_norm * (-0.7*min(t/num_iters, 1) + 1) 
 
 
-        # use learn_rate scheduler which decrease from 1*args.learn_rate to 0.1*args.learn_rate
-        learn_rate = args.learn_rate * (-0.9*t/num_iters + 1)  
+        # use learn_rate scheduler which decrease from 1*args.learn_rate to lr_decay_final_ratio*args.learn_rate
+        # Note: descrease learn_rate improves the defense to Byzantine attack (fixed learn-rate make it accuracy -> 10%)
+        learn_rate = args.learn_rate * ((args.lr_decay_final_ratio - 1)*t/num_iters + 1)  
 
         # select a set of clients (w.p. "client_selected_rate")
         while True:
@@ -246,18 +286,43 @@ def train_one_run(args, r=None, return_dict=None):
 
 
         # good clients compute gradient and update client momentum
-        clients_need_update = good_clients.copy() if beta>0 or t==0 else np.intersect1d(selected, good_clients)
+        clients_need_update = good_clients.copy() if beta>0 else np.intersect1d(selected, good_clients)
         for i in clients_need_update:
             data, target = next(iter(train_loaders[i]))
             data, target = data.to(device), target.to(device)
             gradient = get_smoothed_and_clipped_gradient(global_model, data, target, args, device, max_record_grad_norm)
-            if args.privacy_type == "ldp" and args.noise_multiplier > 0 and max_record_grad_norm > 0:
-                std = args.noise_multiplier * max_record_grad_norm
-                for param in gradient:
-                    param.add_(torch.normal(0, std, param.shape).to(device))
+            if args.aggregate_method == 'sign':
+                # update client_sign_models[i]
+                for idx, global_param in enumerate(global_model.parameters()):
+                    global_param = global_param.data
+                    param = client_sign_models[i][idx]
 
-            for grad_param, momen_param in zip(gradient, client_momentums[i]):
-                momen_param.copy_((1-beta)*grad_param + beta*momen_param)
+                    client_momentums[i][idx].copy_(global_param - param)
+                    if args.noise_multiplier > 0 and max_record_grad_norm > 0:
+                        std = args.noise_multiplier * max_record_grad_norm * learn_rate
+                        client_momentums[i][idx].add_(torch.normal(0, std, param.shape).to(device))
+
+                    param.add_(gradient[idx]+0.01*torch.sign(param-global_param), alpha=-learn_rate)
+
+            else:
+                if args.privacy_type in ["ldp", "ddp"] and args.noise_multiplier > 0 and max_record_grad_norm > 0:
+                    std = args.noise_multiplier * max_record_grad_norm
+                    if args.privacy_type == "ddp":
+                        std *= 0.3
+                    for param in gradient:
+                        param.add_(torch.normal(0, std, param.shape).to(device))
+
+                for grad_param, momen_param in zip(gradient, client_momentums[i]):
+                    momen_param.copy_((1-beta)*grad_param + beta*momen_param)
+
+        # for mtb attack, update attacker.benign_momentums
+        if args.attack_type == 'mtb' and num_bad_clients > 0:
+            for i in range(num_bad_clients):
+                data, target = next(iter(train_loaders[i]))
+                data, target = data.to(device), target.to(device)
+                gradient = get_smoothed_and_clipped_gradient(global_model, data, target, args, device, max_record_grad_norm)
+                for grad_param, momen_param in zip(gradient, attacker.benign_momentums[i]):
+                    momen_param.copy_((1-beta)*grad_param + beta*momen_param)
 
 
         
@@ -273,6 +338,9 @@ def train_one_run(args, r=None, return_dict=None):
 
             elif args.attack_type ==  "lf":
                 byzantine_LF(global_model, client_momentums, attacker, learn_rate, args, device)
+
+            elif args.attack_type == 'mtb':
+                byzantine_MTB_minmax(client_momentums, attacker, args)
             
             elif args.attack_type != "no_attack":
                 raise ValueError("Something wrong with args.attack_type !")
@@ -285,30 +353,34 @@ def train_one_run(args, r=None, return_dict=None):
             server_aggregate_average(global_model, global_momentum, client_momentums, selected, learn_rate, max_record_grad_norm, max_client_clip_norm, args, device)
         elif args.aggregate_method == "median":
             server_aggregate_median(global_model, global_momentum, client_momentums, selected, learn_rate, max_record_grad_norm, args, device)
+        elif args.aggregate_method == "sign":
+            server_aggregate_sign(global_model, client_momentums, selected, learn_rate, device)
         else:
             raise NotImplementedError
 
 
         # test the global model on the main task and backdoor subtask (if applicable)
-        if idx < num_points and t == t_list[idx]:
-            test_loss[idx], test_acc[idx] = test_model(global_model, test_loader, device)
+        if metric_idx < num_points and t == t_list[metric_idx]:
+            test_loss[metric_idx], test_acc[metric_idx] = test_model(global_model, test_loader, device)
             if args.attack_type ==  "backdoor":
                 # only when testing backdoor subtask of cifar, we need to duplicate test data
                 if args.name_dataset == "cifar":
-                    backdoor_test_loss[idx], backdoor_test_acc[idx] = test_model_duplicate(
+                    backdoor_test_loss[metric_idx], backdoor_test_acc[metric_idx] = test_model_duplicate(
                             global_model, attacker.test_loader, device)
                 else:
-                    backdoor_test_loss[idx], backdoor_test_acc[idx] = test_model(
+                    backdoor_test_loss[metric_idx], backdoor_test_acc[metric_idx] = test_model(
                         global_model, attacker.test_loader, device)
 
             if args.show_iter_acc:
                 # print the process
-                print("t={},  test_loss={:.3f},  test_acc={:.1f}%".format(t, test_loss[idx], test_acc[idx]*100))
+                print("t={},  test_loss={:.3f},  test_acc={:.1f}%".format(t, test_loss[metric_idx], test_acc[metric_idx]*100))
                 if args.attack_type ==  "backdoor":
-                    print("   backdoor_test_loss={:.3f},  backdoor_test_acc={:.1f}%".format(backdoor_test_loss[idx], backdoor_test_acc[idx]*100))
+                    print("   backdoor_test_loss={:.3f},  backdoor_test_acc={:.1f}%".format(backdoor_test_loss[metric_idx], backdoor_test_acc[metric_idx]*100))
 
 
-            idx += 1
+            metric_idx += 1
+
+    print(f"Training time: {int(time.time() - start_time)} seconds")
 
     # determine how to return the result
     if r != None and return_dict != None:
@@ -358,6 +430,9 @@ def train_multi_runs(args):
 def train_one_run_and_write_to_file(args, filename):
     result = train_multi_runs(args)
     print("test_acc = ", result["test_acc"])
+    dirname = os.path.dirname(filename)
+    if not os.path.exists(dirname):
+        os.makedirs(dirname)
     pickle.dump([args, result], open(filename, "wb"))
     print("Completed filename = ", filename)
 

@@ -17,9 +17,10 @@ import yaml
 class Attacker:
     train_loader = None # training data with benign records
     train_loader_poison = None # training data with poisoned records
-    test_loader = None # with poisoned labeles
+    test_loader = None # with poisoned labeles (only for )
     model = None
     optimizer = None
+    benign_momentums = None
 
 
 class MnistCNN(nn.Module):

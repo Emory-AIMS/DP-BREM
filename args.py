@@ -40,14 +40,22 @@ def get_args():
         "-q",
         "--client-selected-rate",
         type=float,
-        default=0.2,
+        default=1.0,
         help="the rate of one client selected by the server for agregation, i.e., q",
     )
     parser.add_argument(
+        "-lr",
         "--learn-rate",
         type=float,
         default=0.1,
         help="learning rate of the global model, i.e., \eta  (default: 0.1)",
+    )
+    parser.add_argument(
+        "-lrdecay",
+        "--lr-decay-final-ratio",
+        type=float,
+        default=0.1,
+        help="learning rate decay: from 1 * ini_learn_rate to lr_decay_final_ratio * ini_learn_rate",
     )
     parser.add_argument(
         "--aggregate-method",
@@ -91,7 +99,7 @@ def get_args():
         "--attack-type",
         type=str,
         default="no_attack",
-        help="options: 'no_attack', 'backdoor', 'byzantine' (default: 'no_attack')",
+        help="options: 'no_attack', 'ipm', 'alie', 'lf', 'mtb' (default: 'no_attack')",
     )
     parser.add_argument(
         "-K",
@@ -139,11 +147,18 @@ def get_args():
         help="number of Monte Carlo experiments for gradient smoothing ",
     )
 
+    # other args
     parser.add_argument(
         "--show-iter-acc",
         action="store_true",
         default=False,
         help="show iteration loss (default: False)",
+    )
+    parser.add_argument(
+        "--use-inefficient-clip",
+        action="store_true",
+        default=False,
+        help="use inefficient clip (only for efficiency evaluation)",
     )
     return parser.parse_args() 
 
@@ -153,6 +168,8 @@ def set_args(name_dataset, aggregate_method, privacy_type, noise_multiplier, att
              num_clients=None, num_iters=None, num_runs=None,
              client_selected_rate=None, max_record_grad_norm=None, 
              client_clip_type=None, max_client_clip_norm=None, client_momentum=None,
+             learn_rate=None, lr_decay_final_ratio=None,
+             record_sampled_rate=None, 
              print_args=False):
 
     
@@ -179,6 +196,11 @@ def set_args(name_dataset, aggregate_method, privacy_type, noise_multiplier, att
     if client_clip_type: args.client_clip_type = client_clip_type
     if max_client_clip_norm: args.max_client_clip_norm = max_client_clip_norm
     if client_momentum: args.client_momentum = client_momentum
+
+    if learn_rate: args.learn_rate = learn_rate
+    if lr_decay_final_ratio: args.lr_decay_final_ratio = lr_decay_final_ratio
+
+    if record_sampled_rate: args.record_sampled_rate = record_sampled_rate
     
 
 
@@ -192,10 +214,10 @@ def check_args(args, print_args=True):
     make sure there is no conflicts on the args, and then print the values of args
     """
 
-    if args.aggregate_method not in ['average', 'median']:
+    if args.aggregate_method not in ['average', 'median', 'sign']:
         raise ValueError("Unrecognized aggregate_method")
 
-    if args.privacy_type not in ['no_dp', 'ldp', 'cdp']:
+    if args.privacy_type not in ['no_dp', 'ldp', 'cdp', 'ddp']:
         raise ValueError("Unrecognized privacy_type")
     
     # when no_dp, we neigher clip nor add noise 
@@ -208,20 +230,22 @@ def check_args(args, print_args=True):
         args.num_smooth = 1 
 
     # check attack_type and num_bad_clients
-    if args.attack_type not in ['no_attack', 'ipm', 'alie', 'lf']:
+    if args.attack_type not in ['no_attack', 'ipm', 'alie', 'lf', 'mtb']:
         raise ValueError("Unrecognized attack_type")
 
     if args.attack_type == 'no_attack':
         args.num_bad_clients = 0
     elif args.num_bad_clients == 0:
-        ValueError("For this attack_type, the value of num_bad_clients should larger than 0!")
-
+        raise ValueError("For this attack_type, the value of num_bad_clients should larger than 0!")
+    
+    # check lr_decay_final_ratio
+    if args.lr_decay_final_ratio < 0.01 or args.lr_decay_final_ratio > 1:
+        raise ValueError("lr_decay_final_ratio should in the range [0.01, 1]")
 
     
     # check client_clip_type
-    if args.client_clip_type not in ['center_clip',  'direct_clip']:
-        args.client_clip_type = 'center_clip'
-        print("Unrecognized client_clip_type. Set it to be 'center_clip' ")
+    if args.client_clip_type not in ['center_clip',  'direct_clip', 'element_clip']:
+        raise ValueError("Unrecognized client_clip_type")
 
     if print_args == True:
         print("\n")
