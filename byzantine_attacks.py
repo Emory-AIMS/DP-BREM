@@ -6,7 +6,7 @@ import torch
 import numpy as np
 import scipy
 import torch.nn as nn
-from utils import get_smoothed_and_clipped_gradient, zeros_list_like, get_list_diff_norm, get_clipped_avg
+from utils import get_clipped_gradient, get_list_diff_norm
 
 
 def get_gradient_list(global_model, train_loaders, num_bad_clients, args, device):
@@ -14,7 +14,7 @@ def get_gradient_list(global_model, train_loaders, num_bad_clients, args, device
     for i in range(num_bad_clients):
         data, target = next(iter(train_loaders[i]))
         data, target = data.to(device), target.to(device)
-        gradient_list.append(get_smoothed_and_clipped_gradient(global_model, data, target, args, device))
+        gradient_list.append(get_clipped_gradient(global_model, data, target, args, device))
     return gradient_list 
 
 
@@ -67,7 +67,7 @@ def byzantine_IPM_or_ALIE(global_model, client_momentums, train_loaders, args, d
             epsilon = 1  # parameters for IPM attack
             bad_gradient = -epsilon * gradient_mean[idx]
         elif args.attack_type ==  "alie":
-            scale = 4  # this huristic scale make larger impact on non-defence aggregation
+            scale = 4   # this huristic scale make larger impact on non-defence aggregation
             bad_gradient = gradient_mean[idx] - scale * gradient_std[idx] * z_max
         else:
             raise NotImplementedError
@@ -79,42 +79,24 @@ def byzantine_IPM_or_ALIE(global_model, client_momentums, train_loaders, args, d
     return None
 
 
-def byzantine_LF(global_model, client_momentums, attacker, learn_rate, args, device):
-    criterion = nn.CrossEntropyLoss()
-    model = attacker.model
-    optimizer = attacker.optimizer
+def byzantine_LF(global_model, client_momentums, attacker, args, device):
 
-    # sync the global model to the attacker's model
-    model.load_state_dict(global_model.state_dict())
+    data, target = next(iter(attacker.train_loader))
+    # flip the label (femnist dataset has 62 classes, while others have 10 classes)
+    if args.name_dataset == "femnist":
+        flipped_target = 61 - target
+    else:
+        flipped_target = 9 - target  
+    data, target, flipped_target = data.to(device), target.to(device), flipped_target.to(device)
 
-    # train the attacker's model with 10 steps
-    model.train()
-    num_iter = 10
-    for _ in range(num_iter):
-        data, target = next(iter(attacker.train_loader))
-        target = 9 - target  # flip the label
-        data, target = data.to(device), target.to(device)
+    good_gradient = get_clipped_gradient(global_model, data, target, args, device)
+    bad_gradient = get_clipped_gradient(global_model, data, flipped_target, args, device)
     
-        model.zero_grad()  
-        output = model(data)
-        loss = criterion(output, target)
-        loss.backward()
-        optimizer.step()
-
 
     with torch.no_grad():
-        # replace the bad clients' momentum by the difference to the global model
-        bad_momentum = zeros_list_like(global_model, device)
-        for idx, (param_global, param) in enumerate(zip(global_model.parameters(), model.parameters())):
-
-            # Note: DO NOT divided by num_bad_clients (regard it as some gradient)
-            bad_momentum[idx].copy_(  (param_global.data - param.data)/learn_rate )  
-
-
-
         for i in range(args.num_bad_clients):
             for idx, param in enumerate(client_momentums[i]):
-                param.copy_( bad_momentum[idx] )
+                param.copy_( bad_gradient[idx] - good_gradient[idx] )
 
     return None
 
@@ -139,7 +121,7 @@ def byzantine_MTB_minmax(client_momentums, attacker, args):
     # Step 1. compute deviation 
     # As suggected by the paper, sign-vector is more effective for MNIST, 
     # while std-vector is more effective for CIFAR-10
-    if args.name_dataset == 'mnist':
+    if args.name_dataset in ['mnist', 'femnist']:
         deviation = [torch.sign(param) for param in update_mean]
     elif args.name_dataset == 'cifar':
         deviation = update_std

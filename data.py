@@ -3,10 +3,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import torch.utils
 from torchvision import datasets, transforms
 # to split the dataset into non-iid subset
-from torch.utils.data import Subset 
+from torch.utils.data import Subset, Dataset
 # to assemble different existing datasets (a list of Dataset) 
+import tensorflow as tf
+import tensorflow_federated as tff
+import random
+import warnings
+warnings.filterwarnings("ignore")
 
 from opacus.utils.uniform_sampler import UniformWithReplacementSampler
 from opacus.grad_sample import GradSampleModule
@@ -16,8 +22,6 @@ import yaml
 
 class Attacker:
     train_loader = None # training data with benign records
-    train_loader_poison = None # training data with poisoned records
-    test_loader = None # with poisoned labeles (only for )
     model = None
     optimizer = None
     benign_momentums = None
@@ -61,6 +65,27 @@ class CifarCNN(nn.Module):
         x = self.fc2(x)
         return x
 
+class FemnistCNN(nn.Module):
+    def __init__(self):
+        super(FemnistCNN, self).__init__()
+        self.conv1 = nn.Conv2d(1, 32, 3, 1)
+        self.conv2 = nn.Conv2d(32, 64, 3, 1)
+        self.dropout1 = nn.Dropout(0.25)
+        self.dropout2 = nn.Dropout(0.5)
+        self.fc1 = nn.Linear(9216, 128)
+        self.fc2 = nn.Linear(128, 62)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.conv2(x)
+        x = F.relu(x)
+        x = F.max_pool2d(x, 2)
+        x = self.dropout1(x)
+        x = torch.flatten(x, 1)
+        x = self.fc1(x)
+        x = self.dropout2(x)
+        x = self.fc2(x)
+        return x
 
 
 def load_data_mnist(args):
@@ -77,7 +102,6 @@ def load_data_mnist(args):
     attacker= Attacker()
 
     data_root = "../../data/mnist"
-    test_batch_size = 1000
     num_clients = args.num_clients
 
 
@@ -117,170 +141,26 @@ def load_data_mnist(args):
     # Load test data
     test_loader = torch.utils.data.DataLoader(
         datasets.MNIST(data_root, train=False, transform=transform),
-        batch_size = test_batch_size,
-        shuffle=True
-    )
-
-
-    
-    # Load attacker training data and test data 
-    if args.num_bad_clients > 0:
-        attacker_batch_size = 256
-
-         # training data: benign records
-        attacker.train_loader = torch.utils.data.DataLoader(
-            Subset(train_data, idx_attacker),
-            batch_size = attacker_batch_size,
-            shuffle=True 
-        )
-
-        if args.attack_type ==  "backdoor": 
-
-            # training data: poisoned records (triggered images and modified labels)
-            train_data_poison = datasets.MNIST(data_root, train=True, download=True, transform=transform)
-            train_data_poison.data[:, -2:, -2:] = 255
-            train_data_poison.targets[:] = 0
-            attacker.train_loader_poison = torch.utils.data.DataLoader(
-                Subset(train_data_poison, idx_attacker),
-                batch_size = attacker_batch_size,
-                shuffle=True 
-            )
-
-            # test data: poisoned records (triggered images and modified labels)
-            backdoor_test_data = datasets.MNIST(data_root, train=False, transform=transform)
-            index_list = np.where(np.array(backdoor_test_data.targets) != 0)[0]
-            backdoor_test_data.data[:, -2:, -2:] = 255
-            backdoor_test_data.targets[:] = 0
-            attacker.test_loader = torch.utils.data.DataLoader(
-                Subset(backdoor_test_data, index_list), # only for images with true label not 0
-                batch_size = test_batch_size,
-                shuffle=True
-            )
-
-
-    return train_loaders, test_loader, attacker
-
-
-"""
-def load_data_mnist_ardis_backdoor(args):
-    
-    # MNIST dataset: This function loads a list of train_loaders (each for one client) and one test_loader
-
-    def get_ardis_dataset(data_root, transform, train=True):
-        
-        # The raw ARDIS data can be downloaded (and then unrar) from:
-        # https://raw.githubusercontent.com/ardisdataset/ARDIS/master/ARDIS_DATASET_IV.rar
-        
-        # load the data from csv's
-        filename_prefix = "../../data/ARDIS/ARDIS_"
-        if train:
-            filename_prefix += "train_"
-        else:
-            filename_prefix += "test_"
-        ardis_images=np.loadtxt(filename_prefix+'2828.csv', dtype='float')
-        ardis_labels=np.loadtxt(filename_prefix+'labels.csv', dtype='float')
-
-        #### reshape to be [samples][width][height]
-        ardis_images = ardis_images.reshape(ardis_images.shape[0], 28, 28).astype('float32')
-
-        # labels are one-hot encoded
-        indices_seven = np.where(ardis_labels[:,7] == 1)[0]
-        images_seven = ardis_images[indices_seven,:]
-        images_seven = torch.tensor(images_seven).type(torch.uint8)
-
-        ardis_dataset = datasets.MNIST(data_root, train=train, download=True, transform=transform)
-        ardis_dataset.data = images_seven
-        ardis_dataset.targets = torch.ones(len(indices_seven)).type(torch.int)  # modify lable 7 to label 1
-
-        return ardis_dataset
-
-    transform = transforms.Compose(
-        [transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))]
-    )
-
-
-    # idx_attacker is the index of malicious clients's data, which includes semantic poisoned images and other benign images
-    idx_attacker = np.array([]).astype(int)
-
-    data_root = "../../data/mnist"
-    num_clients = args.num_clients
-    train_data = datasets.MNIST(data_root, train=True, download=True, transform=transform)
-
-    # random shard for each client (non-iid for federated learning)
-    shard_per_client = 6
-    num_shards = shard_per_client*num_clients
-    shards = np.arange(num_shards)
-    shard_size = int(60000 / num_shards)
-    np.random.shuffle(shards)
-    
-    idx_sort = np.argsort(train_data.targets.numpy())
-    train_data_split = []
-    for i in range(num_clients):
-        my_shards = shards[(i * shard_per_client) : (i + 1) * shard_per_client]
-        idx = np.array([]).astype(int)
-        for j in my_shards:
-            select = idx_sort[(j * shard_size): (j + 1) * shard_size]
-            idx = np.concatenate((idx, select), axis=None)
-
-        train_data_subset = datasets.MNIST(data_root, train=True, download=False, transform=transform)
-        train_data_subset.data = train_data_subset.data[idx]
-        train_data_subset.targets = train_data_subset.targets[idx]
-        train_data_split.append(train_data_subset)
-
-
-        # We let the first num_bad_clients clients as the malicious ones
-        if i < args.num_bad_clients:
-            idx_attacker= np.concatenate((idx_attacker, idx), axis=None)
-
-    # Load training data (a list of DataLoader, where each for one client)
-    train_loaders = [torch.utils.data.DataLoader(
-        x, batch_sampler=UniformWithReplacementSampler(
-            num_samples=len(x),
-            sample_rate=args.record_sampled_rate)
-        ) for x in train_data_split]
-    
-    # Load test data
-    test_loader = torch.utils.data.DataLoader(
-        datasets.MNIST(data_root, train=False, transform=transform),
         batch_size = 1024,
         shuffle=True
     )
 
 
     
-    attacker= Attacker()
     # Load attacker training data and test data 
     if args.num_bad_clients > 0:
-        attacker_batch_size = 256
 
          # training data: benign records
         attacker.train_loader = torch.utils.data.DataLoader(
             Subset(train_data, idx_attacker),
-            batch_size = attacker_batch_size,
+            batch_size = 256,
             shuffle=True 
         )
 
-        if args.attack_type ==  "backdoor": 
-
-            # training data: poisoned records (triggered images and modified labels)
-            train_data_poison = get_ardis_dataset(data_root, transform, train=True)
-            attacker.train_loader_poison = torch.utils.data.DataLoader(
-                train_data_poison,
-                batch_size = attacker_batch_size,
-                shuffle=True 
-            )
-
-            # test data: poisoned records (triggered images and modified labels)
-            # even when no backdoor attack, we still can test the backdoor task (just for comparison purpose)
-            backdoor_test_data = get_ardis_dataset(data_root, transform, train=True)
-            attacker.test_loader = torch.utils.data.DataLoader(
-                backdoor_test_data, 
-                batch_size = len(backdoor_test_data.data),
-                shuffle=True
-            )
 
     return train_loaders, test_loader, attacker
-"""
+
+
 
 
 
@@ -305,18 +185,8 @@ def load_data_cifar(args):
         ]
     )
 
-    with open("../../data/config/cifar_backdoor.yaml", "r") as f: 
-        config = yaml.safe_load(f)
-
-    # idx_attackeris the index of malicious clients's data
-    # which includes semantic poisoned images and other benign images
-    idx_attacker= np.array([]).astype(int) 
-    idx_poison_train = config["background_wall"]        # index of poisoned images in the training data
-    idx_poison_test = config["background_wall_test"]    # index of poisoned images in the test data
-    attacker= Attacker()
 
     data_root = "../../data/cifar10"
-    test_batch_size = 1000
     num_clients = args.num_clients
     data_per_client = int(50000 / num_clients) 
 
@@ -324,10 +194,8 @@ def load_data_cifar(args):
     targets = np.array(train_data.targets)
     train_data_split = []
 
-    if args.attack_type ==  "backdoor": 
-        # label poison images as -1, which makes benign clients do not have these
-        targets[idx_poison_train] = -1 
-        
+    # idx_attackeris the index of malicious clients's data
+    idx_attacker= np.array([]).astype(int) 
 
 
     for i in range(num_clients):
@@ -357,42 +225,120 @@ def load_data_cifar(args):
     # Load test data
     test_loader = torch.utils.data.DataLoader(
         datasets.CIFAR10(data_root, train=False, transform=transform_test),
-        batch_size = test_batch_size,
+        batch_size = 1024,
         shuffle=True
     )
 
 
     # Load attacker training data and test data 
+    attacker= Attacker()
     if args.num_bad_clients > 0:
         # training data: benign records
         attacker.train_loader = torch.utils.data.DataLoader(
             Subset(train_data, idx_attacker),
-            batch_size = min(len(idx_poison_train)*10, len(idx_attacker)),
+            batch_size = 256,
             shuffle=True
         )
 
-        if args.attack_type ==  "backdoor":
+    return train_loaders, test_loader, attacker
 
-            # training data: poisoned records (triggered images and modified labels)
-            for j in idx_poison_train: 
-                train_data.targets[j] = 2 # modify the label from car (class 1) to bird (class 2)
-            attacker.train_loader_poison = torch.utils.data.DataLoader(
-                Subset(train_data, idx_poison_train),
-                batch_size = len(idx_poison_train),
-                shuffle=True
-            )
 
-            # test data: poisoned records (attackerimages and modified labels)
-            # we use randomly rotated and cropped versions (via "transform_train") 
-            backdoor_test_data = datasets.CIFAR10(data_root, train=False, transform=transform_train)
-            for j in idx_poison_test: 
-                backdoor_test_data.targets[j] = 2
-            
-            attacker.test_loader = torch.utils.data.DataLoader(
-                Subset(backdoor_test_data, idx_poison_test),
-                batch_size = len(idx_poison_test)
-            )
+class TFDatasetToTorch(Dataset):
+    def __init__(self, data, transform=None):
+        self.transform = transform
+        self.data = []
+        for image, label in data:
+            image = image.copy()
+            label = label.copy().squeeze()
+            label = torch.tensor(label, dtype=torch.long)
+            self.data.append((image, label))
 
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        image, label = self.data[idx]
+        if self.transform:
+            image = self.transform(image)
+        return image, label
+    
+
+def load_data_femnist(args):
+    #config = tf.compat.v1.ConfigProto()
+    #config.gpu_options.per_process_gpu_memory_fraction = 0.02
+    #session = tf.compat.v1.Session(config=config)
+    
+    train_transform = transforms.Compose([
+        transforms.ToPILImage(),
+        transforms.RandomRotation(20),
+        transforms.ToTensor(),
+        transforms.Normalize((0.1307,), (0.3081,))
+    ])
+
+    test_transform = transforms.Compose([
+        transforms.ToPILImage(),
+        transforms.ToTensor(),
+        transforms.Normalize((0.1307,), (0.3081,))
+    ])
+
+    data_root = "../../data/femnist"
+    num_clients = args.num_clients
+
+    raw_train, raw_test = tff.simulation.datasets.emnist.load_data(cache_dir=data_root, only_digits=False)
+    def train_preprocess(dataset):
+        def batch_format_fn(element):
+            return (tf.reshape(element['pixels'], [28, 28]), 
+                    tf.reshape(element['label'], [1]))
+        return dataset.map(batch_format_fn) 
+
+    def test_preprocess(dataset):
+        def batch_format_fn(element):
+            return (tf.reshape(element['pixels'], [28, 28]), 
+                    tf.reshape(element['label'], [1]))
+        return dataset.map(batch_format_fn)
+    
+    raw_train = raw_train.preprocess(train_preprocess)
+    raw_test = raw_test.preprocess(test_preprocess)
+
+    trainSetList = []
+    for cid in raw_train.client_ids[:num_clients]:
+        data_train = list(raw_train.create_tf_dataset_for_client(cid).as_numpy_iterator())
+        trainSetList.append(TFDatasetToTorch(data_train, transform=train_transform))
+    random.shuffle(trainSetList)
+
+    testSetList = []
+    for cid in raw_test.client_ids[:num_clients]:
+        data_test = list(raw_test.create_tf_dataset_for_client(cid).as_numpy_iterator())
+        testSetList.append(TFDatasetToTorch(data_test, transform=test_transform))
+
+    
+
+    client_data_sizes = []
+
+    train_loaders = []
+    for subset in trainSetList:
+        train_loader = torch.utils.data.DataLoader(
+            subset, batch_sampler=UniformWithReplacementSampler(
+            num_samples=len(subset),
+            sample_rate=args.record_sampled_rate)
+        )
+        train_loaders.append(train_loader)
+        client_data_sizes.append(len(subset))
+    #print(f"client_data_sizes = {client_data_sizes}")
+
+    test_loader = torch.utils.data.DataLoader(
+        torch.utils.data.ConcatDataset(testSetList),
+        batch_size = 1024,
+        shuffle=True
+    )
+
+    attacker= Attacker()
+    if args.num_bad_clients > 0:
+        attacker.train_loader = torch.utils.data.DataLoader(
+            torch.utils.data.ConcatDataset(trainSetList[:args.num_bad_clients]),
+            batch_size = 256,
+            shuffle=True,
+        )
 
     return train_loaders, test_loader, attacker
 
@@ -403,8 +349,10 @@ def load_data(args):
         return load_data_mnist(args)
     elif args.name_dataset == "cifar":
         return load_data_cifar(args)
+    elif args.name_dataset == "femnist":
+        return load_data_femnist(args)
     else:
-        print("The dataset should be 'mnist' or 'cifar'! ")
+        print("The dataset should be 'mnist' or 'cifar' or 'femnist'! ")
         raise NotImplementedError
 
 
@@ -419,8 +367,10 @@ def prepare_model(args, device):
         model = MnistCNN().to(device)
     elif args.name_dataset == "cifar":
         model = CifarCNN().to(device)
+    elif args.name_dataset == "femnist":
+        model = FemnistCNN().to(device)
     else:
-        print("The dataset should be either 'mnist' or 'cifar'! ")
+        print("The dataset should be 'mnist' or 'cifar' or 'femnist'! ")
         raise NotImplementedError
 
     return GradSampleModule(model, batch_first=True, loss_reduction="mean")
@@ -430,10 +380,6 @@ def prepare_data_model(args, device):
 
     train_loaders, test_loader, attacker = load_data(args)
     global_model = prepare_model(args, device)
-    
-    
-    attacker.model = prepare_model(args, device)
-    attacker.optimizer = optim.SGD(attacker.model.parameters(), lr=args.learn_rate, momentum=0)
 
 
 

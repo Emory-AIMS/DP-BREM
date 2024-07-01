@@ -12,56 +12,10 @@ mp.set_start_method('spawn', force=True)
 
 from data import prepare_data_model
 from byzantine_attacks import byzantine_IPM_or_ALIE, byzantine_LF, byzantine_MTB_minmax
-from utils import zeros_list_like, clip_list_, get_smoothed_and_clipped_gradient
+from utils import zeros_list_like, clip_list_, get_clipped_gradient
+import warnings
+warnings.filterwarnings("ignore")
 
-
-def backdoor_update(global_model, client_momentums, backdoor, args, device):
-    """
-    How backdoor clients update. We only use data poisoning attack with more local training steps 
-    but without model replacement.
-    """
-    criterion = nn.CrossEntropyLoss()
-    model = backdoor.model
-    optimizer = backdoor.optimizer
-
-    # sync the global model to the backdoor model
-    model.load_state_dict(global_model.state_dict())
-
-
-    # train the backdoor model with 5 steps
-    model.train()
-    for _ in range(5):
-
-        data_benign, target_benign = next(iter(backdoor.train_loader))
-        data_poison, target_poison = next(iter(backdoor.train_loader_poison))
-
-        data, target = torch.cat((data_benign, data_poison)), torch.cat((target_benign, target_poison))
-        data, target = data.to(device), target.to(device)
-
-        # Remark: use model.zero_grad() instead of optimizer.zero_grad(), 
-        # otherwise the GUP usage will keep increasing (because we use GradSampleModule)
-        model.zero_grad()  
-        output = model(data)
-        loss = criterion(output, target)
-        loss.backward()
-        optimizer.step()
-    
-
-    with torch.no_grad():
-
-        # replace the backdoor momentum by the difference to the global model
-        bad_momentum = zeros_list_like(global_model, device)
-        for idx, (param_global, param) in enumerate(zip(global_model.parameters(), model.parameters())):
-            bad_momentum[idx].copy_(  param_global.data - param.data )
-
-
-        # since the expected number of selected bad clients is "num_expected_bad", 
-        # we assume that they can coordinate with each other and divide the bad gradient
-        for i in range(args.num_bad_clients):
-            for idx, param in enumerate(client_momentums[i]):
-                param.copy_( bad_momentum[idx] )
-
-    return None
 
 
 def server_aggregate_median(global_model, global_momentum, client_momentums, selected, learn_rate, max_record_grad_norm, args, device):
@@ -196,27 +150,7 @@ def test_model(model, test_loader, device):
     test_loss /= cnt + 1
 
     return test_loss, accuracy
-            
-
-
-def test_model_duplicate(model, test_loader, device):
-    """
-    When testing cifar backdoor task, we need to duplicate the testing examples (but with crop and random flip of the image) to get enought testing examples
-    """
-    loss_func = nn.CrossEntropyLoss()
-    data, target = [], []
-    for _ in range( int(1000/len(test_loader)) ):
-        data_temp, target_temp = next(iter(test_loader))
-        data.append(data_temp)
-        target.append(target_temp)
-    data, target = torch.cat(data), torch.cat(target)
-    data, target = data.to(device), target.to(device)
-    output = model(data)
-    test_loss = loss_func(output, target).item()
-    pred = output.argmax(dim=1, keepdim=True)
-    correct = pred.eq(target.view_as(pred)).sum().item()
-    accuracy = correct / len(pred)
-    return test_loss, accuracy
+        
 
 
 
@@ -238,7 +172,6 @@ def train_one_run(args, r=None, return_dict=None):
         np.zeros(num_points),
         np.zeros(num_points),
     )
-    backdoor_test_loss, backdoor_test_acc = np.zeros(num_points), np.zeros(num_points)
 
     # load data, initialize the models
     train_loaders, test_loader, global_model, attacker = prepare_data_model(args, device)
@@ -276,7 +209,7 @@ def train_one_run(args, r=None, return_dict=None):
 
         # use learn_rate scheduler which decrease from 1*args.learn_rate to lr_decay_final_ratio*args.learn_rate
         # Note: descrease learn_rate improves the defense to Byzantine attack (fixed learn-rate make it accuracy -> 10%)
-        learn_rate = args.learn_rate * ((args.lr_decay_final_ratio - 1)*t/num_iters + 1)  
+        learn_rate = args.learn_rate * ((args.lr_decay_final_ratio - 1)*t/num_iters + 1)
 
         # select a set of clients (w.p. "client_selected_rate")
         while True:
@@ -290,7 +223,7 @@ def train_one_run(args, r=None, return_dict=None):
         for i in clients_need_update:
             data, target = next(iter(train_loaders[i]))
             data, target = data.to(device), target.to(device)
-            gradient = get_smoothed_and_clipped_gradient(global_model, data, target, args, device, max_record_grad_norm)
+            gradient = get_clipped_gradient(global_model, data, target, args, device, max_record_grad_norm)
             if args.aggregate_method == 'sign':
                 # update client_sign_models[i]
                 for idx, global_param in enumerate(global_model.parameters()):
@@ -320,7 +253,7 @@ def train_one_run(args, r=None, return_dict=None):
             for i in range(num_bad_clients):
                 data, target = next(iter(train_loaders[i]))
                 data, target = data.to(device), target.to(device)
-                gradient = get_smoothed_and_clipped_gradient(global_model, data, target, args, device, max_record_grad_norm)
+                gradient = get_clipped_gradient(global_model, data, target, args, device, max_record_grad_norm)
                 for grad_param, momen_param in zip(gradient, attacker.benign_momentums[i]):
                     momen_param.copy_((1-beta)*grad_param + beta*momen_param)
 
@@ -328,16 +261,13 @@ def train_one_run(args, r=None, return_dict=None):
         
         # bad clients update momentum
         if min(selected) < num_bad_clients:  # if at least one bad clients is selected
-            if args.attack_type ==  "backdoor":
-                # bad clients train one backdoor model and update their momentums
-                backdoor_update(global_model, client_momentums, attacker, args, device)
 
-            elif args.attack_type in  ["ipm", "alie"]:
+            if args.attack_type in  ["ipm", "alie"]:
                 byzantine_IPM_or_ALIE(global_model, client_momentums, train_loaders, args, device)
 
 
             elif args.attack_type ==  "lf":
-                byzantine_LF(global_model, client_momentums, attacker, learn_rate, args, device)
+                byzantine_LF(global_model, client_momentums, attacker, args, device)
 
             elif args.attack_type == 'mtb':
                 byzantine_MTB_minmax(client_momentums, attacker, args)
@@ -359,24 +289,13 @@ def train_one_run(args, r=None, return_dict=None):
             raise NotImplementedError
 
 
-        # test the global model on the main task and backdoor subtask (if applicable)
+        # test the global model on the main task
         if metric_idx < num_points and t == t_list[metric_idx]:
             test_loss[metric_idx], test_acc[metric_idx] = test_model(global_model, test_loader, device)
-            if args.attack_type ==  "backdoor":
-                # only when testing backdoor subtask of cifar, we need to duplicate test data
-                if args.name_dataset == "cifar":
-                    backdoor_test_loss[metric_idx], backdoor_test_acc[metric_idx] = test_model_duplicate(
-                            global_model, attacker.test_loader, device)
-                else:
-                    backdoor_test_loss[metric_idx], backdoor_test_acc[metric_idx] = test_model(
-                        global_model, attacker.test_loader, device)
 
             if args.show_iter_acc:
                 # print the process
                 print("t={},  test_loss={:.3f},  test_acc={:.1f}%".format(t, test_loss[metric_idx], test_acc[metric_idx]*100))
-                if args.attack_type ==  "backdoor":
-                    print("   backdoor_test_loss={:.3f},  backdoor_test_acc={:.1f}%".format(backdoor_test_loss[metric_idx], backdoor_test_acc[metric_idx]*100))
-
 
             metric_idx += 1
 
@@ -429,6 +348,7 @@ def train_multi_runs(args):
 
 def train_one_run_and_write_to_file(args, filename):
     result = train_multi_runs(args)
+    np.set_printoptions(precision=4)
     print("test_acc = ", result["test_acc"])
     dirname = os.path.dirname(filename)
     if not os.path.exists(dirname):

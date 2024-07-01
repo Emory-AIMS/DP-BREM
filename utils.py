@@ -61,18 +61,17 @@ def get_clip_factor_for_one_batch(lst: list, max_norm: float) -> torch.Tensor:
     return clip_factor
 
 
-def _get_smoothed_and_clipped_gradient_inefficient(model, data, target, args, device, max_record_grad_norm=-1):
+def _get_clipped_gradient_inefficient(model, data, target, args, device, max_record_grad_norm=-1):
     
     # For a batch of training data, compute the average of all per-example gradients, where each per-example gradient
     # is smoothed and then clipped
     
     criterion = nn.CrossEntropyLoss()
 
-    noise_smooth = args.noise_smooth
     batch_size = len(target)
     model.train()
     
-    if noise_smooth == 0 and max_record_grad_norm < 0: # which means no-smooth and no-record-clip
+    if max_record_grad_norm < 0: # which means no-record-clip
         grad = zeros_list_like(model, device)
         model.zero_grad()
         output = model(data)
@@ -82,34 +81,16 @@ def _get_smoothed_and_clipped_gradient_inefficient(model, data, target, args, de
             grad[idx].add_( param.grad )
         return grad
 
-    
-    
-    def update_grad_sample(model, grad_sample):
-        model.zero_grad()
-        output = model(data)
-        loss = criterion(output, target)
-        loss.backward()
-        for idx, param in enumerate(model.parameters()):
-            grad_sample[idx].add_( param.grad_sample )
-
-    
 
     grad_sample = zeros_list_like(model, device, add_dim=batch_size) 
-    if noise_smooth == 0:
-        update_grad_sample(model, grad_sample)
-    else:
-        num_smooth = args.num_smooth
-        state_dict_copy = model.state_dict().copy()
-        for _smooth_idx in range(num_smooth):
-            model.load_state_dict(state_dict_copy, strict=True)
-            for param in model.parameters():
-                param.data.add_(torch.normal(0, noise_smooth, param.shape).to(device))
-            update_grad_sample(model, grad_sample)
-        model.load_state_dict(state_dict_copy, strict=True)
-    
-        # average grad_sample over multiple smoothings
-        for param in grad_sample:
-            param.copy_( param/num_smooth )
+
+    model.zero_grad()
+    output = model(data)
+    loss = criterion(output, target)
+    loss.backward()
+    for idx, param in enumerate(model.parameters()):
+        grad_sample[idx].add_( param.grad_sample )
+
     
     
     # clip the grad per-example and accumulate to "grad"
@@ -124,23 +105,21 @@ def _get_smoothed_and_clipped_gradient_inefficient(model, data, target, args, de
 
 
 
-def get_smoothed_and_clipped_gradient(model, data, target, args, device, max_record_grad_norm=-1):
+def get_clipped_gradient(model, data, target, args, device, max_record_grad_norm=-1):
     """
     For a batch of training data, compute the average of all per-example gradients, where each per-example gradient
     is smoothed and then clipped
     """
 
     if args.use_inefficient_clip:
-        return _get_smoothed_and_clipped_gradient_inefficient(model, data, target, args, device, max_record_grad_norm)
+        return _get_clipped_gradient_inefficient(model, data, target, args, device, max_record_grad_norm)
 
 
     criterion = nn.CrossEntropyLoss()
-
-    noise_smooth = args.noise_smooth
     batch_size = len(target)
     model.train()
     
-    if noise_smooth == 0 and max_record_grad_norm < 0: # which means no-smooth and no-record-clip
+    if max_record_grad_norm < 0: # which means no-record-clip
         grad = zeros_list_like(model, device)
         model.zero_grad()
         output = model(data)

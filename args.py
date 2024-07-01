@@ -106,7 +106,7 @@ def get_args():
         "--num-bad-clients",
         type=int,
         default=0,
-        help="number of malicious clients who implement backdoor/Byzantine attacks, i.e., K (default: 0)"
+        help="number of malicious clients who implement Byzantine attacks, i.e., K (default: 0)"
     )
 
     # defense-related args
@@ -129,22 +129,6 @@ def get_args():
         type=float,
         default=0,
         help="client momentum for SGD, i.e., beta=1-alpha (default: )",
-    )
-
-    # grad_smooth related args
-    parser.add_argument(
-        "-s",
-        "--noise-smooth",
-        type=float,
-        default=0,
-        help="noise added on model parameters for gradient smoothing ",
-    )
-    parser.add_argument(
-        "-N",
-        "--num-smooth",
-        type=int,
-        default=20,
-        help="number of Monte Carlo experiments for gradient smoothing ",
     )
 
     # other args
@@ -224,10 +208,6 @@ def check_args(args, print_args=True):
     if args.privacy_type == "no_dp":
         args.max_record_grad_norm = -1
         args.noise_multiplier = 0   
-
-    # when disable smooth (i.e., args.noise_smooth == 0), we only use one Monte Carlo experiment
-    if args.noise_smooth == 0:
-        args.num_smooth = 1 
 
     # check attack_type and num_bad_clients
     if args.attack_type not in ['no_attack', 'ipm', 'alie', 'lf', 'mtb']:
